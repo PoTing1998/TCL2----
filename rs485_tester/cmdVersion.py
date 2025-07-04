@@ -3,7 +3,7 @@ import datetime # 匯入 datetime 模組用於時間戳記
 import os       # 匯入 os 模組用於路徑操作和目錄建立
 from log_exporter import LogToExcelExporter
 
- # 或傳入自訂名稱，例如 export_to_excel("my_output.xlsx")
+# 或傳入自訂名稱，例如 export_to_excel("my_output.xlsx")
 
 # 從 serial_utils.py 匯入我們定義的類別和函式
 from serial_utils import RS485Tester, list_available_ports
