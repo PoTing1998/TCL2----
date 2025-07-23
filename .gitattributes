@@ -1,0 +1,2 @@
+*.exe filter=lfs diff=lfs merge=lfs -text
+rs485_tester/dist/UIVersion.exe filter=lfs diff=lfs merge=lfs -text

@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(powershell:*)",
+      "Bash(ls:*)",
+      "Bash(pyinstaller:*)",
+      "Bash(\"UIVersion_optimized.exe\")",
+      "Bash(./UIVersion_optimized.exe)",
+      "Bash(pip install:*)",
+      "Bash(git checkout:*)",
+      "Bash(git rm:*)",
+      "Bash(git commit:*)",
+      "Bash(git add:*)",
+      "Bash(git branch:*)"
+    ],
+    "deny": []
+  }
+}
