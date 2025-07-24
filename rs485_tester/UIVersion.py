@@ -76,12 +76,15 @@ class EnhancedRS485GuiApp:
         """設定主視窗"""
         self.root.title("Enhanced RS485/TCP 測試工具")
         self.root.geometry(MAIN_WINDOW_SIZE)
+        # 綁定關閉事件
+        self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
         
     def _initialize_components(self):
         """初始化組件"""
         self.connection_manager = ConnectionManager()
         self.theme_manager = ThemeManager(self.root)
         self.monitoring_active = False
+        self.auto_send_threads = {}  # 追蹤自動發送線程
         
     def _setup_ui(self):
         """設定使用者介面"""
@@ -147,6 +150,9 @@ class EnhancedRS485GuiApp:
         widths = {"#0": 150, "type": 80, "address": 200, "status": 80, "stats": 200}
         for col, width in widths.items():
             self.connection_tree.column(col, width=width)
+        
+        # 綁定選擇事件
+        self.connection_tree.bind("<<TreeviewSelect>>", self._on_connection_select)
             
         self.connection_tree.pack(fill=tk.X, pady=(0, 10))
         
@@ -181,12 +187,161 @@ class EnhancedRS485GuiApp:
         input_frame = ttk.Frame(parent)
         input_frame.pack(fill=tk.X)
         
-        ttk.Label(input_frame, text="十六進位:").pack(side=tk.LEFT)
-        self.hex_entry = ttk.Entry(input_frame, width=40)
+        # 裝置ID選擇器
+        ttk.Label(input_frame, text="裝置ID:").pack(side=tk.LEFT)
+        self.device_id_var = tk.StringVar(value="01")
+        self.device_id_combo = ttk.Combobox(input_frame, textvariable=self.device_id_var, width=8, 
+                                          values=[f"{i:02X}" for i in range(1, 248)], state="readonly")
+        self.device_id_combo.pack(side=tk.LEFT, padx=(5, 10))
+        
+        ttk.Label(input_frame, text="指令:").pack(side=tk.LEFT)
+        self.hex_entry = ttk.Entry(input_frame, width=35)
         self.hex_entry.pack(side=tk.LEFT, padx=(5, 10), fill=tk.X, expand=True)
         
         ttk.Button(input_frame, text="📤 發送", command=self._send_to_selected).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(input_frame, text="📤 廣播", command=self._broadcast_command).pack(side=tk.LEFT, padx=(0, 5))
+    
+    def _insert_command(self, command_template):
+        """插入指令並替換裝置ID"""
+        device_id = self.device_id_var.get()
+        # 替換指令模板中的 {ID} 變數
+        command = command_template.replace("{ID}", device_id)
+        
+        # 清空現有指令並插入新指令
+        self.hex_entry.delete(0, tk.END)
+        self.hex_entry.insert(0, command)
+    
+    def _send_to_selected(self):
+        """發送指令到選定的連線"""
+        selection = self.connection_tree.selection()
+        if not selection:
+            messagebox.showwarning("警告", "請選擇目標連線")
+            return
+            
+        item = selection[0]
+        name = self.connection_tree.item(item)['text']
+        command = self.hex_entry.get().strip()
+        
+        if not command:
+            messagebox.showwarning("警告", "請輸入指令")
+            return
+            
+        self._send_command_to_connection(name, command)
+    
+    def _broadcast_command(self):
+        """廣播指令到所有連線"""
+        command = self.hex_entry.get().strip()
+        if not command:
+            messagebox.showwarning("警告", "請輸入指令") 
+            return
+            
+        connections = self.connection_manager.get_all_connections()
+        if not connections:
+            messagebox.showwarning("警告", "沒有可用的連線")
+            return
+            
+        for name in connections.keys():
+            self._send_command_to_connection(name, command)
+    
+    def _calculate_modbus_crc(self, data_hex):
+        """計算Modbus CRC16"""
+        try:
+            # 移除空格並轉換為bytes
+            data = bytes.fromhex(data_hex.replace(" ", ""))
+            
+            crc = 0xFFFF
+            for byte in data:
+                crc ^= byte
+                for _ in range(8):
+                    if crc & 0x0001:
+                        crc >>= 1
+                        crc ^= 0xA001
+                    else:
+                        crc >>= 1
+            
+            # CRC是小端序，先低字節後高字節
+            crc_low = crc & 0xFF
+            crc_high = (crc >> 8) & 0xFF
+            
+            return f"{crc_low:02X} {crc_high:02X}"
+        except:
+            return ""
+    
+    def _add_crc_if_needed(self, command):
+        """如果需要，為指令添加CRC"""
+        command = command.strip()
+        if not command:
+            return command
+            
+        # 檢查是否已經包含CRC（簡單判斷：至少6個字節）
+        hex_bytes = command.replace(" ", "")
+        if len(hex_bytes) >= 12:  # 至少6個字節
+            return command
+            
+        # 為短指令自動添加CRC
+        crc = self._calculate_modbus_crc(command)
+        if crc:
+            return f"{command} {crc}"
+        return command
+    
+    def _send_command_to_connection(self, name, command):
+        """發送指令到指定連線"""
+        try:
+            # 添加CRC如果需要
+            command_with_crc = self._add_crc_if_needed(command)
+            
+            # 驗證十六進位字串
+            validated_command = self._validate_hex_string(command_with_crc)
+            
+            conn_info = self.connection_manager.get_connection(name)
+            connection = conn_info['connection']
+            conn_type = conn_info['type']
+            
+            # 記錄發送的完整指令
+            timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            
+            if conn_type == 'TCP':
+                # TCP連線發送
+                data = bytes.fromhex(validated_command.replace(" ", ""))
+                connection.send_data(data)
+                response = connection.receive_data()
+            else:
+                # Serial連線發送
+                connection.send_hex(command_with_crc)
+                response_bytes = connection.receive_response()
+                response = response_bytes.hex(' ').upper() if response_bytes else "無回應"
+            
+            # 記錄交易統計
+            success = response != "無回應" and response != "回應逾時"
+            response_time = 100.0 if success else 0.0  # 簡化的回應時間
+            
+            stats = self.connection_manager.get_statistics(name)
+            if stats:
+                stats.add_transaction(success, response_time if success else None)
+            
+            # 更新日誌
+            self._log_transaction(name, timestamp, command_with_crc, response, response_time)
+            
+        except Exception as e:
+            error_msg = f"發送失敗: {e}"
+            self.log_manager.add_log(error_msg, name)
+            messagebox.showerror("錯誤", error_msg)
+    
+    def _log_transaction(self, name, timestamp, command, response, response_time):
+        """記錄交易日誌"""
+        # 建立日誌訊息
+        log_msg = f"[{timestamp}]\n"
+        log_msg += f"📤 發送: {command}\n"
+        log_msg += f"📥 接收: {response}\n"
+        log_msg += f"⏱️ 回應時間: {response_time:.1f}ms\n"
+        log_msg += "-" * 50 + "\n"
+        
+        # 記錄到總覽和專屬日誌
+        self.log_manager.add_log(f"[{name}] 📤 {command} → 📥 {response}", "overview")
+        self.log_manager.add_log(log_msg, name)
+        
+        # 更新連線樹狀檢視
+        self._update_connection_tree()
         
     def _create_timer_settings(self, parent):
         """建立定時發送設定"""
@@ -201,6 +356,10 @@ class EnhancedRS485GuiApp:
         
         self.timer_button = ttk.Button(timer_frame, text="⏰ 開始定時", command=self._toggle_auto_send)
         self.timer_button.pack(side=tk.LEFT, padx=(10, 0))
+        
+        # 強制停止按鈕（緊急用）
+        self.stop_all_button = ttk.Button(timer_frame, text="🛑 全部停止", command=self._stop_all_timers)
+        self.stop_all_button.pack(side=tk.LEFT, padx=(5, 0))
         
     def _create_log_area(self):
         """建立日誌顯示區域"""
@@ -285,9 +444,17 @@ class EnhancedRS485GuiApp:
         
         if messagebox.askyesno("確認", f"確定要移除連線 '{name}' 嗎？"):
             try:
+                # 停止該連線的自動發送線程
+                if name in self.auto_send_threads:
+                    del self.auto_send_threads[name]
+                
                 self.connection_manager.remove_connection(name)
                 self.log_manager.remove_log_tab(name)
                 self._update_connection_tree()
+                
+                # 重置按鈕狀態
+                self.timer_button.config(text="⏰ 開始定時")
+                
                 self.log_manager.add_log(f"❌ 連線 '{name}' 已移除", "overview")
             except Exception as e:
                 messagebox.showerror("錯誤", f"移除連線失敗: {e}")
@@ -409,9 +576,13 @@ class EnhancedRS485GuiApp:
         item = selection[0]
         name = self.connection_tree.item(item)['text']
         
+        
         if self.connection_manager.is_auto_send_active(name):
             # 停止定時發送
             self.connection_manager.set_auto_send_status(name, False)
+            # 清理線程追蹤
+            if name in self.auto_send_threads:
+                del self.auto_send_threads[name]
             self.timer_button.config(text="⏰ 開始定時")
             self.log_manager.add_log("⏰ 停止定時發送", name)
         else:
@@ -439,12 +610,81 @@ class EnhancedRS485GuiApp:
     def _start_auto_send(self, name, command, interval):
         """開始自動發送"""
         def auto_send_loop():
-            while self.connection_manager.is_auto_send_active(name):
-                if name in self.connection_manager.get_all_connections():
-                    self._send_command_to_connection(name, command)
-                time.sleep(interval / 1000.0)
+            while self.connection_manager.is_auto_send_active(name) and name in self.auto_send_threads:
+                try:
+                    if name in self.connection_manager.get_all_connections():
+                        self._send_command_to_connection(name, command)
+                    time.sleep(interval / 1000.0)
+                except Exception as e:
+                    self.log_manager.add_log(f"⚠️ 定時發送錯誤: {e}", name)
+                    # 發生錯誤時停止自動發送
+                    self.connection_manager.set_auto_send_status(name, False)
+                    # 更新UI按鈕狀態
+                    self.root.after(0, lambda: self._update_timer_button_state(name))
+                    break
+            
+            # 線程結束時清理
+            if name in self.auto_send_threads:
+                del self.auto_send_threads[name]
                 
-        threading.Thread(target=auto_send_loop, daemon=True).start()
+        # 啟動線程並追蹤
+        thread = threading.Thread(target=auto_send_loop, daemon=True)
+        self.auto_send_threads[name] = thread
+        thread.start()
+    
+    def _update_timer_button_state(self, name):
+        """更新定時按鈕狀態"""
+        selection = self.connection_tree.selection()
+        if selection:
+            selected_name = self.connection_tree.item(selection[0])['text']
+            if selected_name == name:
+                if self.connection_manager.is_auto_send_active(name):
+                    self.timer_button.config(text="⏹️ 停止定時")
+                else:
+                    self.timer_button.config(text="⏰ 開始定時")
+    
+    def _on_connection_select(self, event):
+        """處理連線選擇事件"""
+        selection = self.connection_tree.selection()
+        if selection:
+            name = self.connection_tree.item(selection[0])['text']
+            
+            # 更新定時按鈕狀態
+            if self.connection_manager.is_auto_send_active(name):
+                self.timer_button.config(text="⏹️ 停止定時")
+            else:
+                self.timer_button.config(text="⏰ 開始定時")
+            
+            # 載入連線的預設裝置ID
+            try:
+                conn_info = self.connection_manager.get_connection(name)
+                if 'default_device_id' in conn_info:
+                    self.device_id_var.set(conn_info['default_device_id'])
+            except:
+                pass  # 如果沒有預設ID，保持當前選擇
+        else:
+            # 沒有選擇時禁用按鈕
+            self.timer_button.config(text="⏰ 開始定時")
+    
+    def _stop_all_timers(self):
+        """停止所有定時發送"""
+        stopped_count = 0
+        for name in list(self.connection_manager.get_all_connections().keys()):
+            if self.connection_manager.is_auto_send_active(name):
+                self.connection_manager.set_auto_send_status(name, False)
+                if name in self.auto_send_threads:
+                    del self.auto_send_threads[name]
+                stopped_count += 1
+                self.log_manager.add_log("🛑 定時發送已停止", name)
+        
+        # 重置按鈕狀態
+        self.timer_button.config(text="⏰ 開始定時")
+        
+        if stopped_count > 0:
+            self.log_manager.add_log(f"🛑 已停止 {stopped_count} 個定時發送", "overview")
+            messagebox.showinfo("完成", f"已停止 {stopped_count} 個定時發送")
+        else:
+            messagebox.showinfo("提示", "目前沒有運行中的定時發送")
         
     def _toggle_monitoring(self):
         """切換監控模式"""
@@ -472,7 +712,11 @@ class EnhancedRS485GuiApp:
                             self._send_command_to_connection(name, query_cmd)
                     
                     time.sleep(interval / 1000.0)
-                except:
+                except (KeyError, ValueError, TypeError) as e:
+                    self.log_manager.add_log(f"監控錯誤: {e}", "overview")
+                    break
+                except Exception as e:
+                    self.log_manager.add_log(f"監控發生未預期錯誤: {e}", "overview")
                     break
                     
         if self.monitoring_active:
@@ -496,6 +740,52 @@ class EnhancedRS485GuiApp:
             
         # 定期更新
         self.root.after(STATS_UPDATE_INTERVAL, self._update_statistics)
+    
+    def _validate_interval(self, interval_str):
+        """驗證間隔時間輸入"""
+        try:
+            interval = int(interval_str)
+            if interval < MIN_INTERVAL:
+                raise ValueError(f"間隔時間不能小於{MIN_INTERVAL}毫秒")
+            if interval > 3600000:  # 最大1小時
+                raise ValueError("間隔時間不能超過1小時")
+            return interval
+        except ValueError as e:
+            if "invalid literal" in str(e):
+                raise ValueError("請輸入有效的數字")
+            raise
+    
+    def _validate_hex_string(self, hex_str):
+        """驗證十六進位字串輸入"""
+        if not hex_str or not hex_str.strip():
+            raise ValueError("指令不能為空")
+        
+        # 移除空格並檢查
+        hex_clean = hex_str.replace(" ", "")
+        if len(hex_clean) % 2 != 0:
+            raise ValueError("十六進位字串長度必須為偶數")
+        
+        try:
+            bytes.fromhex(hex_clean)
+        except ValueError:
+            raise ValueError("包含無效的十六進位字符")
+        
+        return hex_clean
+    
+    def _validate_tcp_address(self, host, port_str):
+        """驗證TCP地址輸入"""
+        if not host or not host.strip():
+            raise ValueError("主機地址不能為空")
+        
+        try:
+            port = int(port_str)
+            if port < 1 or port > 65535:
+                raise ValueError("端口號必須在1-65535之間")
+            return host.strip(), port
+        except ValueError as e:
+            if "invalid literal" in str(e):
+                raise ValueError("請輸入有效的端口號")
+            raise
         
     def _analyze_packet(self, packet):
         """分析封包"""
@@ -519,6 +809,32 @@ class EnhancedRS485GuiApp:
         
         # 更新分析面板
         self.analysis_panel.update_results(result_text, ascii_result, decimal_result, binary_result)
+    
+    def _on_closing(self):
+        """處理程式關閉事件"""
+        try:
+            # 停止監控
+            self.monitoring_active = False
+            
+            # 停止所有自動發送並清理線程
+            for name in list(self.connection_manager.get_all_connections().keys()):
+                if self.connection_manager.is_auto_send_active(name):
+                    self.connection_manager.set_auto_send_status(name, False)
+            
+            # 清理線程追蹤
+            self.auto_send_threads.clear()
+            
+            # 關閉所有連線
+            for name in list(self.connection_manager.get_all_connections().keys()):
+                try:
+                    self.connection_manager.remove_connection(name)
+                except Exception as e:
+                    print(f"關閉連線 {name} 時發生錯誤: {e}")
+                    
+        except Exception as e:
+            print(f"程式關閉時發生錯誤: {e}")
+        finally:
+            self.root.destroy()
 
 
 class ConnectionDialog:
@@ -576,8 +892,10 @@ class ConnectionDialog:
             self.port_combo['values'] = [f"{dev} ({desc})" for dev, desc in ports]
             if self.port_combo['values']:
                 self.port_combo.set(self.port_combo['values'][0])
-        except:
-            pass
+        except ImportError as e:
+            messagebox.showwarning("警告", f"無法載入串口模組: {e}")
+        except Exception as e:
+            messagebox.showwarning("警告", f"無法取得可用串口: {e}")
         self.port_combo.pack(fill=tk.X, pady=(0, 10))
         
         ttk.Label(self.serial_frame, text="波特率:").pack(anchor=tk.W)
@@ -666,6 +984,198 @@ class ConnectionDialog:
         
     def _create_tcp_connection(self):
         """建立 TCP 連線"""
+        host = self.ip_entry.get().strip()
+        port = int(self.port_entry.get())
+        if not host:
+            raise ValueError("請輸入 IP 位址")
+            
+        conn = TCPConnection(host, port)
+        conn.connect()
+        address = f"{host}:{port}"
+        
+        return conn, address
+
+
+class ConnectionDialog:
+    """連線對話框"""
+    
+    def __init__(self, parent, connection_manager, log_manager, update_callback):
+        self.connection_manager = connection_manager
+        self.log_manager = log_manager
+        self.update_callback = update_callback
+        
+        # 建立對話框
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("新增連線")
+        self.dialog.geometry(CONNECTION_DIALOG_SIZE)
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+        
+        self._create_dialog_ui()
+        
+    def _create_dialog_ui(self):
+        """建立對話框 UI"""
+        main_frame = ttk.Frame(self.dialog, padding=20)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # 連線名稱
+        ttk.Label(main_frame, text="連線名稱:").pack(anchor=tk.W)
+        self.name_entry = ttk.Entry(main_frame, width=30)
+        self.name_entry.pack(fill=tk.X, pady=(0, 10))
+        
+        # 預設裝置ID
+        ttk.Label(main_frame, text="預設裝置ID:").pack(anchor=tk.W)
+        self.device_id_var = tk.StringVar(value="01")
+        device_id_frame = ttk.Frame(main_frame)
+        device_id_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.device_id_combo = ttk.Combobox(device_id_frame, textvariable=self.device_id_var, 
+                                          width=10, values=[f"{i:02X}" for i in range(1, 248)], 
+                                          state="readonly")
+        self.device_id_combo.pack(side=tk.LEFT)
+        
+        ttk.Label(device_id_frame, text="  (可在主界面修改)").pack(side=tk.LEFT)
+        
+        # 連線類型選擇
+        ttk.Label(main_frame, text="連線類型:").pack(anchor=tk.W)
+        self.conn_type = tk.StringVar(value="Serial")
+        
+        type_frame = ttk.Frame(main_frame)
+        type_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Radiobutton(type_frame, text="Serial (RS485)", variable=self.conn_type, 
+                       value="Serial", command=self._on_type_change).pack(side=tk.LEFT)
+        ttk.Radiobutton(type_frame, text="TCP", variable=self.conn_type, 
+                       value="TCP", command=self._on_type_change).pack(side=tk.LEFT, padx=(20, 0))
+        
+        # 設定區域
+        self.settings_frame = ttk.LabelFrame(main_frame, text="連線設定", padding=10)
+        self.settings_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        # 初始建立 Serial 設定
+        self._create_serial_settings()
+        
+        # 按鈕區域
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X)
+        
+        ttk.Button(btn_frame, text="取消", command=self.dialog.destroy).pack(side=tk.RIGHT)
+        ttk.Button(btn_frame, text="連線", command=self._create_connection).pack(side=tk.RIGHT, padx=(0, 10))
+        
+    def _on_type_change(self):
+        """連線類型改變時的處理"""
+        # 清空設定區域
+        for widget in self.settings_frame.winfo_children():
+            widget.destroy()
+            
+        if self.conn_type.get() == "Serial":
+            self._create_serial_settings()
+        else:
+            self._create_tcp_settings()
+    
+    def _create_serial_settings(self):
+        """建立 Serial 設定"""
+        self.serial_frame = ttk.Frame(self.settings_frame)
+        self.serial_frame.pack(fill=tk.X)
+        
+        ttk.Label(self.serial_frame, text="COM Port:").pack(anchor=tk.W)
+        self.port_combo = ttk.Combobox(self.serial_frame, state="readonly")
+        
+        try:
+            from serial_utils import list_available_ports
+            ports = list_available_ports()
+            self.port_combo['values'] = [f"{dev} ({desc})" for dev, desc in ports]
+            if self.port_combo['values']:
+                self.port_combo.set(self.port_combo['values'][0])
+        except ImportError as e:
+            messagebox.showwarning("警告", f"無法載入串口模組: {e}")
+        except Exception as e:
+            messagebox.showwarning("警告", f"無法取得可用串口: {e}")
+        
+        self.port_combo.pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Label(self.serial_frame, text="波特率:").pack(anchor=tk.W)
+        self.baud_combo = ttk.Combobox(self.serial_frame, values=BAUDRATES, state="readonly")
+        self.baud_combo.set(str(DEFAULT_BAUDRATE))
+        self.baud_combo.pack(fill=tk.X)
+        
+    def _create_tcp_settings(self):
+        """建立 TCP 設定"""
+        self.tcp_frame = ttk.Frame(self.settings_frame)
+        self.tcp_frame.pack(fill=tk.X)
+        
+        ttk.Label(self.tcp_frame, text="IP 位址:").pack(anchor=tk.W)
+        self.ip_entry = ttk.Entry(self.tcp_frame)
+        self.ip_entry.insert(0, DEFAULT_TCP_HOST)
+        self.ip_entry.pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Label(self.tcp_frame, text="Port:").pack(anchor=tk.W)
+        self.port_entry = ttk.Entry(self.tcp_frame)
+        self.port_entry.insert(0, str(DEFAULT_TCP_PORT))
+        self.port_entry.pack(fill=tk.X)
+        
+    def _create_connection(self):
+        """建立連線"""
+        try:
+            name = self.name_entry.get().strip()
+            if not name:
+                messagebox.showwarning("警告", "請輸入連線名稱")
+                return
+                
+            if name in self.connection_manager.get_all_connections():
+                messagebox.showwarning("警告", "連線名稱已存在")
+                return
+            
+            # 根據連線類型建立連線
+            if self.conn_type.get() == "Serial":
+                connection, address = self._create_serial_connection(name)
+                conn_type = "Serial"
+            else:
+                connection, address = self._create_tcp_connection()
+                conn_type = "TCP"
+            
+            # 添加連線到管理器（包含預設裝置ID）
+            self.connection_manager.add_connection(name, connection, conn_type, address)
+            
+            # 儲存預設裝置ID到連線資訊中
+            conn_info = self.connection_manager.get_connection(name)
+            conn_info['default_device_id'] = self.device_id_var.get()
+            
+            # 建立日誌分頁
+            self.log_manager.setup_log_tab(name, name)
+            
+            # 更新 UI
+            self.update_callback()
+            
+            self.log_manager.add_log(f"✅ 連線 '{name}' 建立成功 (預設ID: {self.device_id_var.get()})", "overview")
+            self.log_manager.add_log(f"✅ 連線 '{name}' 建立成功", name)
+            
+            self.dialog.destroy()
+            messagebox.showinfo("成功", f"連線 '{name}' 建立成功")
+            
+        except Exception as e:
+            messagebox.showerror("錯誤", f"連線建立失敗: {e}")
+            
+    def _create_serial_connection(self, name):
+        """建立 Serial 連線"""
+        port = self.port_combo.get().split(' ')[0] if self.port_combo.get() else ""
+        if not port:
+            raise ValueError("請選擇 COM Port")
+            
+        from serial_utils import RS485Tester
+        baudrate = int(self.baud_combo.get())
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        os.makedirs(LOG_DIR, exist_ok=True)
+        log_path = os.path.join(LOG_DIR, f"log_{name}_{timestamp}.log")
+        
+        conn = RS485Tester(port=port, baudrate=baudrate, log_file=log_path)
+        address = f"{port} ({baudrate})"
+        
+        return conn, address
+        
+    def _create_tcp_connection(self):
+        """建立 TCP 連線"""
+        from connection_manager import TCPConnection
         host = self.ip_entry.get().strip()
         port = int(self.port_entry.get())
         if not host:

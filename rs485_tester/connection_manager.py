@@ -103,8 +103,11 @@ class TCPConnection:
         if self.socket:
             try:
                 self.socket.close()
-            except:
-                pass
+            except (AttributeError, OSError) as e:
+                # 記錄關閉錯誤但不中斷流程
+                print(f"警告: 關閉連線時發生錯誤: {e}")
+            except Exception as e:
+                print(f"關閉連線時發生未預期錯誤: {e}")
             finally:
                 self.connected = False
                 self.socket = None
@@ -125,8 +128,20 @@ class ConnectionManager:
     
     def add_connection(self, name, connection, conn_type, address):
         """新增連線"""
+        if not name or not name.strip():
+            raise ValueError("連線名稱不能為空")
+        
         if name in self.connections:
             raise ValueError(f"連線名稱 '{name}' 已存在")
+        
+        if connection is None:
+            raise ValueError("連線物件不能為None")
+        
+        if not conn_type or conn_type not in ['TCP', 'Serial']:
+            raise ValueError("連線類型必須為 'TCP' 或 'Serial'")
+        
+        if not address or not address.strip():
+            raise ValueError("連線地址不能為空")
         
         self.connections[name] = {
             'connection': connection,
@@ -150,8 +165,10 @@ class ConnectionManager:
         try:
             if hasattr(conn_info['connection'], 'close'):
                 conn_info['connection'].close()
-        except:
-            pass
+        except (AttributeError, OSError) as e:
+            print(f"警告: 關閉連線 '{name}' 時發生錯誤: {e}")
+        except Exception as e:
+            print(f"關閉連線 '{name}' 時發生未預期錯誤: {e}")
         
         # 清理資料
         del self.connections[name]
